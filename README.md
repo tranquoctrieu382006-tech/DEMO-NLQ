@@ -66,9 +66,10 @@ flowchart TD
    - Giúp giảm độ dài prompt, tiết kiệm token và tránh làm mô hình bị phân tâm bởi các bảng không liên quan.
 3. **Không để LLM sinh SQL thô trực tiếp:**
    - LLM chỉ đóng vai trò phân tích câu hỏi và trả về cấu trúc JSON đã được định nghĩa (`metric`, `group_by`, `year`, `top_n`).
+   - `group_by` là **danh sách (`list[str]`)**, hỗ trợ truy vấn đa chiều (ví dụ: *"Doanh thu theo sản phẩm và khu vực"* → `GROUP BY product, region`).
    - Việc sinh mã SQL do code lập trình đảm nhiệm, đảm bảo cú pháp luôn đúng và kiểm soát bảo mật tuyệt đối.
 4. **Xử lý tính mơ hồ & An toàn:**
-   - **Chủ động hỏi lại (`clarify`):** Từ *"bán chạy"* có thể hiểu theo doanh thu (`revenue`) hoặc số lượng bán (`units_sold`). Hệ thống phát hiện đụng độ và yêu cầu người dùng xác nhận lại.
+   - **Chủ động hỏi lại (`clarify`):** Từ *"bán chạy"* có thể hiểu theo doanh thu (`revenue`) hoặc số lượng bán (`units_sold`). Hệ thống phát hiện đụng độ và yêu cầu người dùng xác nhận lại. Tầng retrieval tự động kéo tất cả metric chia sẻ synonym mơ hồ vào prompt, đảm bảo LLM luôn có đủ thông tin để phát hiện ambiguity bất kể ngưỡng TF-IDF.
    - **Từ chối dứt khoát (`error`):** Những khái niệm chưa được mô tả trong catalog (như *"lợi nhuận"*) sẽ bị từ chối, ngăn chặn hiện tượng ảo giác (hallucination).
    - **Chống tấn công độc hại:** Bất kỳ chuỗi độc hại nào lọt vào spec JSON (ví dụ: `{"metric": "x; DROP TABLE sales"}`) đều bị lớp kiểm tra logic và whitelist chặn lại trước khi sinh SQL.
 

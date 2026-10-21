@@ -2,6 +2,10 @@
 # Luồng: câu hỏi -> [1] retrieval trên KHO MÔ TẢ schema -> [2] dựng prompt
 #        -> [3] LLM (mock) trả JSON -> [4] code sinh SQL + validate -> [5] chạy
 # Điểm khác demo 2: bạn KHÔNG viết luật cho từng câu, chỉ cung cấp "sách giáo khoa" (CATALOG) + "hàng rào" (validate).
+#
+# [Cải tiến v2]
+#   1. group_by: str|null  ->  group_by: list[str]   (hỗ trợ đa chiều)
+#   2. retrieve_schema: đảm bảo synonym mơ hồ luôn kéo hết metric liên quan (fix clarify)
 import math, re, sqlite3, json
 from collections import Counter
 
@@ -56,10 +60,39 @@ def cos(a, b):
     return dot / (na * nb) if na and nb else 0.0
 dvecs = [vec(d) for d in docs]
 
+# Xây danh sách synonym mơ hồ: từ nào xuất hiện ở >= 2 metric
+# -> khi câu hỏi chứa từ đó, phải kéo TẤT CẢ metric liên quan vào kết quả retrieval
+# để tầng LLM có đủ thông tin phát hiện ambiguity và trả clarify.
+def _build_ambiguous_map():
+    """Trả về dict: synonym -> [catalog_entry, ...] (chỉ với synonym thuộc >= 2 metric)."""
+    from collections import defaultdict
+    syn_to_metrics = defaultdict(list)
+    for e in CATALOG:
+        if e["kind"] == "metric":
+            for s in e["syn"]:
+                syn_to_metrics[s].append(e)
+    return {s: entries for s, entries in syn_to_metrics.items() if len(entries) >= 2}
+
+AMBIGUOUS_SYN_MAP = _build_ambiguous_map()   # {"bán chạy": [revenue_entry, units_sold_entry]}
+
 def retrieve_schema(q, top_k=4, min_score=0.08):
     qv = vec(tok(q))
-    s = sorted(((cos(qv, v), e) for v, e in zip(dvecs, CATALOG)), key=lambda x: -x[0])
-    return [(sc, e) for sc, e in s[:top_k] if sc >= min_score]
+    scored = sorted(((cos(qv, v), e) for v, e in zip(dvecs, CATALOG)), key=lambda x: -x[0])
+    hits = [(sc, e) for sc, e in scored[:top_k] if sc >= min_score]
+
+    # --- FIX clarify: nếu câu hỏi chứa synonym mơ hồ, kéo hết metric liên quan ---
+    q_lower = q.lower()
+    hit_names = {e["name"] for _, e in hits}
+    for syn, related_entries in AMBIGUOUS_SYN_MAP.items():
+        if syn in q_lower:
+            for entry in related_entries:
+                if entry["name"] not in hit_names:
+                    # Tính score thật để log chính xác, nhưng ép vào kết quả dù dưới threshold
+                    real_score = cos(qv, vec(tok(entry_text(entry))))
+                    hits.append((real_score, entry))
+                    hit_names.add(entry["name"])
+
+    return hits
 
 # ---------- [2] DỰNG PROMPT ----------
 def build_prompt(q, hits):
@@ -67,7 +100,7 @@ def build_prompt(q, hits):
                       for _, e in hits)
     return ("Bạn là bộ phân tích câu hỏi dữ liệu. Chỉ dùng các mục trong SCHEMA bên dưới.\n"
             f"Hôm nay là {TODAY}.\n"
-            "Chỉ trả về JSON: {metric, group_by, year, top_n} hoặc {error} hoặc {clarify}.\n"
+            "Chỉ trả về JSON: {metric, group_by (list of strings), year, top_n} hoặc {error} hoặc {clarify}.\n"
             "Nếu thiếu chỉ số, trả error. Nếu một từ khớp nhiều chỉ số, trả clarify (không đoán).\n\n"
             f"SCHEMA:\n{lines}\n\nCÂU HỎI: {q}")
 
@@ -87,7 +120,8 @@ def mock_llm(prompt):
         return json.dumps({"error": "Không có chỉ số phù hợp trong schema."})
     metric = metrics[0]
     dims = [i for i in items if i["kind"] == "dimension" and i["table"] == metric["table"]
-            and any(re.search(rf"(từng|theo|mỗi)\s+{s}|{s}\s+nào", q) for s in i["syn"])]
+            and any(re.search(rf"(từng|theo|mỗi)\s+([\w\s]+\s+và\s+)*{s}|{s}\s+nào|(và|,)\s+{s}", q)
+                    for s in i["syn"])]
     year = None
     if any(i["kind"] == "time" for i in items):
         if "năm ngoái" in q: year = today_year - 1
@@ -95,21 +129,33 @@ def mock_llm(prompt):
         else:
             m = re.search(r"\b(20\d{2})\b", q); year = int(m[1]) if m else None
     top_n = 1 if re.search(r"(nhiều nhất|cao nhất|lớn nhất)", q) else None
-    return json.dumps({"metric": metric["name"], "group_by": dims[0]["name"] if dims else None,
-                       "year": year, "top_n": top_n}, ensure_ascii=False)
+    return json.dumps({"metric": metric["name"],
+                        "group_by": [d["name"] for d in dims],   # list thay vì str|null
+                        "year": year, "top_n": top_n}, ensure_ascii=False)
 
 # ---------- [4] CODE sinh SQL từ JSON + kiểm tra an toàn (không tin LLM) ----------
 def build_sql(spec):
     by = {e["name"]: e for e in CATALOG}
     m = by.get(spec["metric"])
     if not m or m["kind"] != "metric": return None            # whitelist theo kho mô tả
-    g = by.get(spec["group_by"]) if spec.get("group_by") else None
-    if g and (g["kind"] != "dimension" or g["table"] != m["table"]): return None
-    sel = (f"{g['expr']}, " if g else "") + f"{m['expr']} AS total"
+
+    # --- group_by: hỗ trợ list[str] (đa chiều) ---
+    raw_gb = spec.get("group_by") or []
+    if isinstance(raw_gb, str):         # backward-compat: chấp nhận cả str lẫn list
+        raw_gb = [raw_gb] if raw_gb else []
+    g_list = []
+    for name in raw_gb:
+        g = by.get(name)
+        if not g or g["kind"] != "dimension" or g["table"] != m["table"]:
+            return None                 # chiều không hợp lệ hoặc khác bảng → chặn
+        g_list.append(g)
+
+    g_exprs = ", ".join(g["expr"] for g in g_list)
+    sel = (f"{g_exprs}, " if g_list else "") + f"{m['expr']} AS total"
     sql, params = f"SELECT {sel} FROM {m['table']}", []
     if spec.get("year") and m["table"] == "sales":
         sql += " WHERE year = ?"; params.append(int(spec["year"]))
-    if g: sql += f" GROUP BY {g['expr']}"
+    if g_list: sql += f" GROUP BY {g_exprs}"
     if spec.get("top_n"): sql += f" ORDER BY total DESC LIMIT {int(spec['top_n'])}"
     return sql, params
 
@@ -135,7 +181,8 @@ if __name__ == "__main__":
               "Doanh thu theo khu vực năm 2024?",
               "Số nhân viên theo phòng ban?",
               "Sản phẩm bán chạy nhất?",                 # mơ hồ -> hỏi lại
+              "Doanh thu theo từng sản phẩm và khu vực?", # [MỚI] đa chiều
               "Lợi nhuận theo sản phẩm?"]:               # chưa định nghĩa -> từ chối
         print("=" * 64); print("Câu hỏi:", q); print(ask(q))
     print("=" * 64)
-    print("Spec độc hại bị chặn:", build_sql({"metric": "x; DROP TABLE sales", "group_by": None}))
+    print("Spec độc hại bị chặn:", build_sql({"metric": "x; DROP TABLE sales", "group_by": []}))
